@@ -1,0 +1,257 @@
+<?php
+
+define('LSI_XML_FEED', 'http://www.lsitools.com/xml/surveys.asp?clientkey=[CLIENT_KEY]&userkey=[USER_KEY][DAYS]');
+
+/**
+ * Implements hook_menu().
+ */
+function rc_lsi_menu() {
+  $items = [];
+
+  // Settings form.
+  $items['admin/rescms/rc-lsi'] = [
+    'title' => 'LSI Reviews',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => ['rc_lsi_form_settings'],
+    'access arguments' => ['administer vrweb_vr'],
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'rc_lsi.admin.inc',
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_rc_core_item_reviews().
+ * @param LDRCItemEntity $item
+ * @return array
+ */
+function rc_lsi_rc_core_item_reviews($item) {
+  if(!$item) {
+    return [];
+  }
+
+  $ldrc_item = $item->getLDRCItem();
+
+  if(!$ldrc_item instanceof LDRCLodgingProduct) {
+    return [];
+  }
+
+  $id = $item->id;
+
+  if($item->engine === 'evrn') {
+    $id = urlencode(_rc_lsi_get_evrn_id($item->eid));
+  }
+
+  if(empty($id)) {
+    return [];
+  }
+
+  $reviews = _rc_lsi_get_lsi_reviews($id);
+
+  // Clone the $item object to avoid accidental modification inside alter hooks later.
+  $item_clone = clone $item;
+
+  // Opens the chance to update all reviews data as obtained from source.
+  drupal_alter('rc_lsi_reviews_source', $reviews, $item_clone);
+
+  if(empty($reviews)){
+    return [];
+  }
+
+  $return = [];
+
+  $config = variable_get('rc_core_engine_reviews_config', array());
+  $default_status = $config[$item->engine][$item->source]['reviews_import_status'] ? : 2;
+
+  foreach($reviews as $review) {
+    // Prepares the guestname.
+    $guestname_first = empty($review['GuestFirstName']['value']) ? '' : $review['GuestFirstName']['value'];
+    $guestname_last = empty($review['GuestLastName']['value']) ? '' : $review['GuestLastName']['value'];
+    $guestname = trim($guestname_first . ' ' . $guestname_last);
+
+    // Set default data for review.
+    $default = [
+      'item_eid' => $item->eid,
+      'headline' => $review['Rating']['value'],
+      'created' => $review['ReviewDate']['value'],
+      'guestname' => $guestname,
+      'comment' => $review['Comments']['value'],
+      'rating' => $review['StarRating']['value'],
+      'source' => 'lsi',
+      'has_responses' => FALSE,
+      'subratings' => [],
+      'status' => $default_status,
+    ];
+
+    // Opens the chance to update a specific review after data processed.
+    $to_alter = $default;
+    drupal_alter('rc_lsi_review', $to_alter, $review, $item_clone);
+
+    // Ensures the use of an empty array in case non valid data is returned.
+    if (empty($to_alter) || !is_array($to_alter)) {
+      $to_alter = [];
+    }
+
+    // Altered review can only change or add items to the equation. It cannot remove entries,
+    // to avoid breaking the process.
+    $return[] = $to_alter + $default;
+  }
+
+  return $return;
+}
+
+/**
+ * Internal function which return reviews of an specific item by id.
+ * @param string $item->eid.
+ */
+function _rc_lsi_get_lsi_reviews($id) {
+  //Load xml file that contains all the reviews from LSI.
+  $xml = _rc_lsi_load_lsi_xml();
+
+  if($xml === FALSE) {
+    return [];
+  }
+
+  // Use xpath to obtain all the reviews where field property = item->id.
+  $xml_result = $xml->xpath('Reviews/Review/Property[. ="' . $id . '"]/parent::*');
+
+  if(empty($xml_result) || $xml_result === FALSE) {
+    return [];
+  }
+
+  $array_result = [];
+
+  foreach($xml_result as $key => $xml_element) {
+    $raw_review = _rc_lsi_xml_to_array($xml_element->asXML());
+
+    if(empty($raw_review)) {
+      continue;
+    }
+
+    // Change keys by name to locate fields easily.
+    $array_result[] = array_reduce($raw_review['children'], function ($result, $item) {
+        $result[$item['name']] = $item;
+        return $result;
+    }, []);
+  }
+
+  return $array_result;
+}
+
+/**
+ * Internal function which loads the lsi xml file to return reviews.
+ */
+function _rc_lsi_load_lsi_xml() {
+  // Manage cache when loading file.
+  $xml = &drupal_static(__FUNCTION__);
+
+  if (!isset($xml)) {
+    if ($cache = cache_get('lsi_xml')) {
+      // Return latest reviews stored in cache.
+      return simplexml_load_string($cache->data);
+    }
+    else {
+      $client_key = variable_get('rc_lsi_client_key', '');
+      $user_key = variable_get('rc_lsi_user_key', '');
+      $last_load = variable_get('rc_lsi_xml_last_load', NULL);
+
+      if(empty($client_key) || empty($user_key)) {
+        return FALSE;
+      }
+
+      $url = str_replace('[CLIENT_KEY]', $client_key, LSI_XML_FEED);
+      $url = str_replace('[USER_KEY]', $user_key, $url);
+
+      if($last_load === NULL) {
+        // File has not been loaded before so it returns all the reviews
+        // by removing day parameter from the url.
+        $url = str_replace('[DAYS]', '', $url);
+      }
+      else {
+        // Always return reviews from the last 7 days.
+        $days = 7;
+        $url = str_replace('[DAYS]', '&days=' . $days, $url);
+      }
+
+      $xml = simplexml_load_file($url);
+
+      if($xml !== FALSE) {
+        // 3hrs = 3 * 60 * 60.
+        $cache_expires = 3 * 60 * 60;
+        cache_set('lsi_xml', $xml->asXML(), 'cache', time() + $cache_expires);
+
+        //Set last load date.
+        variable_set('rc_lsi_xml_last_load', new DateTime("now"));
+      }
+    }
+  }
+  return $xml;
+}
+
+/**
+ * Internal function which returns day difference since the last xml load.
+ */
+function _rc_lsi_day_diff($last_load) {
+  $today = new DateTime("now");
+  $diff = $today->diff($last_load);
+
+  // Get the number of days passed.
+  $days = $diff->format('%a');
+
+  // In case a fraction of a day already passed, count it as another day.
+  $s = $diff->format('%s');
+  $m = $diff->format('%i');
+  $h = $diff->format('%h');
+  if ($s || $m || $h) {
+    $days++;
+  }
+
+  return $days;
+}
+
+/**
+ * Internal function which returns the internal code to be used for evrn engine.
+ */
+function _rc_lsi_get_evrn_id($eid) {
+  return db_query('SELECT code_internal FROM {rc_evrn_escapia_unit} WHERE eid = :eid', [':eid' => $eid], [ 'target' => 'slave' ])->fetchField();
+}
+
+/**
+ * Internal function which converts and xml result to array with its attributes.
+ * Inspiration from https://secure.php.net/manual/en/function.xml-parse-into-struct.php#66487
+ */
+function _rc_lsi_xml_to_array($xml) {
+  $parser = xml_parser_create();
+  xml_parser_set_option($parser, XML_OPTION_CASE_FOLDING, 0);
+  xml_parser_set_option($parser, XML_OPTION_SKIP_WHITE, 1);
+  xml_parse_into_struct($parser, $xml, $tags);
+  xml_parser_free($parser);
+
+  $elements = [];  // the currently filling [child] XmlElement array
+  $stack = [];
+
+  foreach ($tags as $tag) {
+    $index = count($elements);
+    if ($tag['type'] == "complete" || $tag['type'] == "open") {
+      $elements[$index] = [
+         'name' => $tag['tag'],
+         'attributes' => $tag['attributes'],
+         'value' => $tag['value'],
+      ];
+
+      if ($tag['type'] == "open") {  // push
+        $elements[$index]['children'] = [];
+        $stack[count($stack)] = &$elements;
+        $elements = &$elements[$index]['children'];
+      }
+    }
+
+    if ($tag['type'] == "close") {  // pop
+      $elements = &$stack[count($stack) - 1];
+      unset($stack[count($stack) - 1]);
+    }
+  }
+
+  return $elements[0];  // the single top-level element
+};

@@ -1,0 +1,7 @@
+name = ResCMS LSI Module
+description = Provides Support to integrate LSI reviews.
+package = ResCMS
+core = 7.x
+version = 7.x-1.0
+configure = admin/rescms/rc-lsi
+dependencies[] = rc_core
